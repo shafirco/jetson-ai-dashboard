@@ -2,100 +2,95 @@
 
 ## What this project does
 
-A small **web dashboard** for an **edge-AI** scenario: **live webcam** in the browser, periodic frame capture, inference with **YOLOv8n** (Ultralytics) in a **FastAPI** backend, and **detection overlays** (labels, bounding boxes), a **status bar**, and **run history**. Everything runs in **Docker** via Docker Compose.
+**Live webcam** in the browser, a frame snapshot about **every 2 seconds**, **YOLOv8n** (Ultralytics) inference in **FastAPI**, and a **Next.js** UI with **bounding boxes**, labels, status, and **history**. Runs with **Docker Compose**.
 
 ---
 
-## Architecture (short)
+## Architecture
 
 ```
-Browser  →  Next.js (port 3000)  →  POST /api/analyze (Route Handler)
-                                         ↓
-                              FastAPI backend (service: backend, port 8000 in the network)
+Browser  →  Next.js :3000  →  POST /api/analyze (multipart PNG)
+                                    ↓
+                         FastAPI `backend:8000`  →  POST /analyze
 ```
 
-- The **browser** talks only to **Next.js** (same origin).
-- The **Next.js API route** (`/api/analyze`) forwards **multipart** `file` to FastAPI **`POST /analyze`** using **`NEXT_PUBLIC_BACKEND_URL`** (default `http://backend:8000` between containers).
-- **Host access** to FastAPI: **port 8001** → container **8000** (`8001:8000`).
+- The browser calls only **Next.js** (same origin). It does **not** call FastAPI directly.
+- **`NEXT_PUBLIC_BACKEND_URL`** (Compose default: `http://backend:8000`) is the FastAPI base URL used by the Next.js server when proxying to `/analyze`.
+- From the **host machine**, FastAPI is exposed as **http://localhost:8001** (`8001:8000`).
 
 | Path | Role |
 |------|------|
-| `frontend/` | Next.js (App Router), React, TypeScript, Tailwind — UI, `<video>` + overlay canvas, API route |
-| `backend/` | FastAPI — **YOLOv8n** inference, `POST /analyze`, `POST /detect` |
-| `docker-compose.yml` | Builds and runs both services, optional env, memory limits |
+| `frontend/` | Next.js 16 (App Router), React 19, TypeScript, Tailwind 4 |
+| `backend/` | FastAPI, YOLOv8n — `POST /analyze`, `POST /detect`, `GET /health` |
+| `docker-compose.yml` | Services `backend`, `frontend`; optional `.env`; memory `deploy` limits |
 
 ---
 
-## Technologies
+## Stack (as in the repo)
 
-| Layer | Stack |
-|-------|--------|
-| **UI** | Next.js, React 19, TypeScript, Tailwind CSS |
-| **Vision API** | Python 3.11, FastAPI, Uvicorn, **Ultralytics (YOLOv8n)**, Pillow |
-| **Containers** | Docker, Docker Compose |
-| **Frontend image** | Multi-stage build, Next.js **standalone** output |
+| Layer | Details |
+|-------|---------|
+| **Frontend container** | `node:20-alpine`, multi-stage build, Next **`output: 'standalone'`** |
+| **Backend container** | `python:3.11-slim`, `libgl1` + `libglib2.0-0` for OpenCV/Ultralytics |
+| **Python deps** | `fastapi`, `uvicorn`, `pillow`, `python-multipart`, `ultralytics` |
 
 ---
 
-## Backend API (FastAPI)
+## Backend API
 
-| Method | Path | Body | Response (summary) |
-|--------|------|------|----------------------|
-| `POST` | `/analyze` | `multipart/form-data`, field **`file`** (image) | `detections[]` with `label`, `confidence`, `bbox` `{x,y,width,height}`; plus `label`, `detected`, `confidence` for the UI |
+| Method | Path | Request | Success response |
+|--------|------|---------|------------------|
+| `POST` | `/analyze` | `multipart/form-data`, field **`file`** (image bytes) | JSON: `status`, `label`, `detected` (names), `confidence` (average), `detections` — each item: `label`, `confidence`, `bbox` `{ x, y, width, height }` in **image pixels** |
 | `POST` | `/detect` | JSON `{ "image": "<base64>" }` (optional `data:image/...;base64,` prefix) | `{ "objects": [ { "label", "confidence" } ] }` |
 | `GET` | `/health` | — | `{ "status": "alive" }` |
 
-Pretrained **`yolov8n.pt`** uses **COCO** classes (~80 object types). **First container start** may download weights (slower first request).
+Invalid image data → **400** with a short `detail` message.
 
-Interactive docs: [http://localhost:8001/docs](http://localhost:8001/docs) when Compose is up.
+Weights **`yolov8n.pt`** (COCO, 80 classes) load at app startup. The **first run** may **download** the file (slower startup / first inference).
+
+Docs (with Compose running): [http://localhost:8001/docs](http://localhost:8001/docs)
 
 ---
 
-## How to run
+## Run with Docker
 
-**Prerequisites:** [Docker](https://docs.docker.com/get-docker/) and Docker Compose (e.g. Docker Desktop).
-
-From the **project root**:
+**Prerequisites:** Docker with Compose (e.g. Docker Desktop).
 
 ```bash
 docker compose up --build
 ```
 
-First build can take **several minutes** (PyTorch + dependencies). The backend image is large.
+First **backend** build is **slow** and the image is **large** (PyTorch + Ultralytics).
 
-| Service | URL (from your machine) |
-|---------|-------------------------|
+| What | URL |
+|------|-----|
 | Dashboard | [http://localhost:3000](http://localhost:3000) |
-| FastAPI | [http://localhost:8001/docs](http://localhost:8001/docs), `/health` |
+| FastAPI | [http://localhost:8001/docs](http://localhost:8001/docs), [http://localhost:8001/health](http://localhost:8001/health) |
 
-**Optional env:** Copy **`.env.example`** → **`.env`** in the project root for Compose. For local Next dev (no Docker), use **`frontend/.env.example`** → **`frontend/.env.local`**.
+**Env:** Optional root **`.env`** from **`.env.example`** (Compose reads it). For Next on the host: **`frontend/.env.local`** from **`frontend/.env.example`** (e.g. `NEXT_PUBLIC_BACKEND_URL=http://localhost:8001` when the API is on the mapped port).
 
----
-
-## How to stop
+**Stop:**
 
 ```bash
 docker compose down
 ```
 
-Or `Ctrl+C` in the terminal.
+---
+
+## Memory limits (`docker-compose.yml`)
+
+| Service | `deploy.resources.limits.memory` |
+|---------|----------------------------------|
+| `backend` | `1g` |
+| `frontend` | `768M` |
+
+Those are **per-container** caps in the file. Whether they are **strictly enforced** depends on your Docker setup (e.g. Swarm vs Compose alone); use **`docker stats`** to see real usage.
 
 ---
 
-## Memory limits (Compose)
+## Local run without Docker
 
-In **`docker-compose.yml`**, under `deploy.resources.limits.memory`:
-
-- **backend:** `1g` (YOLO + PyTorch need headroom)
-- **frontend:** `768M`
-
-**Note:** With plain `docker compose up`, cgroup limits from `deploy` may behave differently than under Docker Swarm; use **`docker stats`** to see real usage.
-
----
-
-## Local run without Docker (optional)
-
-**Backend:**
+**Backend** (Python **3.11+** recommended to match the image):
 
 ```bash
 cd backend
@@ -114,71 +109,74 @@ npm ci
 npm run dev
 ```
 
-Set `NEXT_PUBLIC_BACKEND_URL` in `frontend/.env.local` (see `frontend/.env.example`), e.g. `http://127.0.0.1:8000`, then open [http://localhost:3000](http://localhost:3000).
+Set **`NEXT_PUBLIC_BACKEND_URL`** in **`frontend/.env.local`** to the FastAPI base (no trailing slash), e.g. `http://127.0.0.1:8000` or `http://localhost:8001` if you use the published Docker port only for the API.
 
 ---
 
 ## Environment variables
 
-| Variable | Purpose |
-|----------|---------|
-| `NEXT_PUBLIC_BACKEND_URL` | FastAPI **base URL** (no trailing slash). Default in Compose: `http://backend:8000`. On host against published port: `http://localhost:8001`. |
+| Variable | Used by | Purpose |
+|----------|---------|---------|
+| `NEXT_PUBLIC_BACKEND_URL` | Compose (frontend build + runtime), local Next | FastAPI base URL for the server-side proxy to **`/analyze`**. |
 
 ---
 
-## Assumptions
+## Notes
 
-- **Webcam:** needs **HTTPS or localhost** and user permission.
-- **Confidence scores** are **model scores**, not guaranteed real-world accuracy; useful for ranking and thresholds.
-- **Bounding boxes** are in **image pixel space** (snapshot is **640×360** in the current UI).
+- **Webcam:** `getUserMedia` needs **localhost or HTTPS** and user permission.
+- **Snapshot size:** The UI captures **640×360**; boxes from YOLO are in that image’s pixel space.
+- **Confidence:** Model confidence scores, not calibrated “real-world accuracy.”
 
 ---
 
-## Publish to GitHub
+## GitHub (repo already exists)
+
+Push updates from the project root:
 
 ```bash
-cd /path/to/jetson-ai-dashboard
-git init
-git branch -M main
 git add -A
 git status
-git commit -m "Initial commit: Jetson AI dashboard with YOLOv8n"
-git remote add origin https://github.com/YOUR_USER/jetson-ai-dashboard.git
-git push -u origin main
+git commit -m "Your message"
+git push origin main
 ```
 
-Create the empty repo on GitHub first, then use its URL. Do **not** commit `.env` / `.env.local` (see `.gitignore`). Commit **`.env.example`** and **`frontend/.env.example`**.
+Tags (example):
+
+```bash
+git tag -a v1.2.1 -m "Release notes"
+git push origin v1.2.1
+```
+
+Do **not** commit **`.env`**, **`frontend/.env.local`**, or secrets. Keep **`.env.example`** and **`frontend/.env.example`** in the repo.
 
 ---
 
-## Publish images to Docker Hub
+## Docker Hub
 
-Replace `YOUR_DOCKERHUB_USER` with your Docker Hub username and pick a tag (e.g. `1.0.0`).
+After `docker compose build`, images are usually named like **`jetson-ai-dashboard-backend`** and **`jetson-ai-dashboard-frontend`** (see `docker images`; the Compose **`name:`** sets the project prefix).
 
 ```bash
 docker login
 docker compose build
 
-docker tag jetson-ai-dashboard-backend:latest  YOUR_DOCKERHUB_USER/jetson-ai-dashboard-backend:1.0.0
-docker tag jetson-ai-dashboard-frontend:latest YOUR_DOCKERHUB_USER/jetson-ai-dashboard-frontend:1.0.0
+docker tag jetson-ai-dashboard-backend:latest  YOUR_USER/jetson-ai-dashboard-backend:1.2.0
+docker tag jetson-ai-dashboard-frontend:latest YOUR_USER/jetson-ai-dashboard-frontend:1.2.0
 
-docker push YOUR_DOCKERHUB_USER/jetson-ai-dashboard-backend:1.0.0
-docker push YOUR_DOCKERHUB_USER/jetson-ai-dashboard-frontend:1.0.0
+docker push YOUR_USER/jetson-ai-dashboard-backend:1.2.0
+docker push YOUR_USER/jetson-ai-dashboard-frontend:1.2.0
 ```
 
-**Frontend build-arg:** If something other than `http://backend:8000` must be baked into the client, build the frontend image explicitly, e.g.:
+To bake a different API URL into the **browser bundle**, build the frontend with a build-arg (matches **`frontend/Dockerfile`**):
 
 ```bash
-docker build -t YOUR_DOCKERHUB_USER/jetson-ai-dashboard-frontend:1.0.0 \
+docker build -t YOUR_USER/jetson-ai-dashboard-frontend:1.2.0 \
   --build-arg NEXT_PUBLIC_BACKEND_URL=http://backend:8000 \
   ./frontend
 ```
 
-Verify local image names with `docker images` if tags differ.
-
 ---
 
-## Extra notes
+## LAN / ports
 
-- **LAN:** Other devices can open `http://<host-ip>:3000` if the firewall allows it.
-- **Ports:** **8001** is the host mapping; **8000** is the port inside the backend container (`backend:8000` on the Compose network).
+- Other devices: `http://<host-LAN-IP>:3000` (firewall permitting).
+- **8001** = host → backend container **8000**; **`backend:8000`** = hostname on the Compose network.
