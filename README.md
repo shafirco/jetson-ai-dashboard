@@ -2,7 +2,10 @@
 
 ## What this project does
 
-**Live webcam** in the browser, a frame snapshot about **every 2 seconds**, **YOLOv8n** (Ultralytics) inference in **FastAPI**, and a **Next.js** UI with **bounding boxes**, labels, status, and **history**. Runs with **Docker Compose**.
+**Live webcam** in the browser, a frame snapshot about **every 2 seconds**, **YOLOv8n** object detection (COCO) in **FastAPI**, and a **Next.js** UI with **bounding boxes**, labels, status, and **history**. Runs with **Docker Compose**.
+
+- **In Docker:** the backend runs **ONNXRuntime** on a baked-in **`yolov8n.onnx`** (small image, no PyTorch at runtime).
+- **Local dev (default):** the backend can use **Ultralytics** with **`yolov8n.pt`** instead — same HTTP API.
 
 ---
 
@@ -21,8 +24,11 @@ Browser  →  Next.js :3000  →  POST /api/analyze (multipart PNG)
 | Path | Role |
 |------|------|
 | `frontend/` | Next.js 16 (App Router), React 19, TypeScript, Tailwind 4 |
-| `backend/` | FastAPI, YOLOv8n — `POST /analyze`, `POST /detect`, `GET /health` |
-| `docker-compose.yml` | Services `backend`, `frontend`; optional `.env`; memory `deploy` limits |
+| `backend/main.py` | FastAPI app; **`YOLO_ONNX_PATH` set → ONNX** via `onnx_infer.py`, **unset → Ultralytics `.pt`** |
+| `backend/onnx_infer.py` | ONNXRuntime inference + NMS (COCO80 labels); used in Docker |
+| `backend/Dockerfile` | **Multi-stage:** export ONNX (CPU PyTorch + Ultralytics), then slim runtime |
+| `backend/.dockerignore` | Keeps build context small (e.g. no local `.pt` / `__pycache__`) |
+| `docker-compose.yml` | Services `backend`, `frontend`; optional `.env`; `deploy` limits |
 
 ---
 
@@ -31,8 +37,9 @@ Browser  →  Next.js :3000  →  POST /api/analyze (multipart PNG)
 | Layer | Details |
 |-------|---------|
 | **Frontend container** | `node:20-alpine`, multi-stage build, Next **`output: 'standalone'`** |
-| **Backend container** | `python:3.11-slim`, `libgl1` + `libglib2.0-0` for OpenCV/Ultralytics |
-| **Python deps** | `fastapi`, `uvicorn`, `pillow`, `python-multipart`, `ultralytics` |
+| **Backend — build stage (`exporter`)** | `python:3.11-slim`, **CPU** `torch` + `torchvision` from [PyTorch CPU wheels](https://download.pytorch.org/whl/cpu), **Ultralytics**, then **`opencv-python` replaced with `opencv-python-headless`** (avoids X11 / `libxcb` in slim). Runs one-shot export: **`yolov8n.pt` → `yolov8n.onnx`** (opset 12, simplify). |
+| **Backend — runtime stage** | `python:3.11-slim`, **`libglib2.0-0`**, **`libgomp1`**, **`onnxruntime`**, NumPy, **OpenCV headless**, FastAPI, Uvicorn, Pillow, `python-multipart`. **`ENV YOLO_ONNX_PATH=/app/yolov8n.onnx`**. **No PyTorch** in the final image — typically **~0.5–0.6 GB** image size vs multi‑GB full-Torch stacks. |
+| **Python (local dev)** | `backend/requirements.txt`: Ultralytics (+ PyTorch via pip). Comment in file explains Docker vs local. Same REST API as the container. |
 
 ---
 
@@ -46,9 +53,18 @@ Browser  →  Next.js :3000  →  POST /api/analyze (multipart PNG)
 
 Invalid image data → **400** with a short `detail` message.
 
-Weights **`yolov8n.pt`** (COCO, 80 classes) load at app startup. The **first run** may **download** the file (slower startup / first inference).
-
 Docs (with Compose running): [http://localhost:8001/docs](http://localhost:8001/docs)
+
+---
+
+## Inference: Docker vs local
+
+| Mode | How it is selected | Model | Notes |
+|------|-------------------|-------|--------|
+| **Docker (Compose)** | `YOLO_ONNX_PATH=/app/yolov8n.onnx` set in **Dockerfile** | `yolov8n.onnx` copied from the **exporter** stage | No weight download at container startup; startup loads ONNX only. |
+| **Local** | Do **not** set `YOLO_ONNX_PATH` (or leave empty) | **`yolov8n.pt`** via Ultralytics | First run may download `yolov8n.pt`. |
+
+To run **ONNX locally** (optional): install `onnxruntime`, `numpy`, `opencv-python-headless`, point **`YOLO_ONNX_PATH`** at your `.onnx` file, and start Uvicorn (Ultralytics not required for that path).
 
 ---
 
@@ -60,7 +76,7 @@ Docs (with Compose running): [http://localhost:8001/docs](http://localhost:8001/
 docker compose up --build
 ```
 
-First **backend** build is **slow** and the image is **large** (PyTorch + Ultralytics).
+The **first backend build** is **slow** (exporter installs CPU PyTorch + Ultralytics and exports ONNX). **Subsequent builds** can cache the exporter layer if dependencies unchanged. The **pushed/runtime image** stays **small** (ONNX + ONNXRuntime only).
 
 | What | URL |
 |------|-----|
@@ -77,20 +93,20 @@ docker compose down
 
 ---
 
-## Memory limits (`docker-compose.yml`)
+## Resource limits (`docker-compose.yml`)
 
-| Service | `deploy.resources.limits.memory` |
-|---------|----------------------------------|
-| `backend` | `1g` |
-| `frontend` | `768M` |
+Under **`deploy.resources.limits`** (enforcement depends on Docker/Swarm setup; use **`docker stats`** for real usage):
 
-Those are **per-container** caps in the file. Whether they are **strictly enforced** depends on your Docker setup (e.g. Swarm vs Compose alone); use **`docker stats`** to see real usage.
+| Service | `memory` | `cpus` |
+|---------|----------|--------|
+| `backend` | `700M` | `4` |
+| `frontend` | `300M` | — |
 
 ---
 
 ## Local run without Docker
 
-**Backend** (Python **3.11+** recommended to match the image):
+**Backend** (Python **3.11+** recommended):
 
 ```bash
 cd backend
@@ -109,29 +125,29 @@ npm ci
 npm run dev
 ```
 
-Set **`NEXT_PUBLIC_BACKEND_URL`** in **`frontend/.env.local`** to the FastAPI base (no trailing slash), e.g. `http://127.0.0.1:8000` or `http://localhost:8001` if you use the published Docker port only for the API.
+Set **`NEXT_PUBLIC_BACKEND_URL`** in **`frontend/.env.local`** to the FastAPI base (no trailing slash), e.g. `http://127.0.0.1:8000` or `http://localhost:8001` if only the published Docker API port is used.
 
 ---
 
 ## Environment variables
 
-| Variable | Used by | Purpose |
-|----------|---------|---------|
+| Variable | Where | Purpose |
+|----------|-------|---------|
 | `NEXT_PUBLIC_BACKEND_URL` | Compose (frontend build + runtime), local Next | FastAPI base URL for the server-side proxy to **`/analyze`**. |
+| `YOLO_ONNX_PATH` | Backend (set in **Dockerfile** for production) | Path to **`yolov8n.onnx`**. When set, **`onnx_infer.OnnxYoloRunner`** is used; when unset, **Ultralytics** loads **`yolov8n.pt`**. |
 
 ---
 
 ## Notes
 
 - **Webcam:** `getUserMedia` needs **localhost or HTTPS** and user permission.
-- **Snapshot size:** The UI captures **640×360**; boxes from YOLO are in that image’s pixel space.
-- **Confidence:** Model confidence scores, not calibrated “real-world accuracy.”
+- **Snapshot size:** The UI captures **640×360**; boxes are in that image’s **pixel space**.
+- **Confidence:** Scores are model outputs, not guaranteed calibrated accuracy.
+- **ONNX postprocess** in `onnx_infer.py` follows the same idea as the [Ultralytics ONNXRuntime example](https://github.com/ultralytics/ultralytics/tree/main/examples/YOLOv8-ONNXRuntime) (check Ultralytics **AGPL-3.0** if you redistribute the service).
 
 ---
 
 ## GitHub (repo already exists)
-
-Push updates from the project root:
 
 ```bash
 git add -A
@@ -153,7 +169,7 @@ Do **not** commit **`.env`**, **`frontend/.env.local`**, or secrets. Keep **`.en
 
 ## Docker Hub
 
-After `docker compose build`, images are usually named like **`jetson-ai-dashboard-backend`** and **`jetson-ai-dashboard-frontend`** (see `docker images`; the Compose **`name:`** sets the project prefix).
+After `docker compose build`, images are usually **`jetson-ai-dashboard-backend`** and **`jetson-ai-dashboard-frontend`** (see `docker images`; Compose **`name:`** sets the prefix).
 
 ```bash
 docker login
@@ -166,7 +182,7 @@ docker push YOUR_USER/jetson-ai-dashboard-backend:1.2.0
 docker push YOUR_USER/jetson-ai-dashboard-frontend:1.2.0
 ```
 
-To bake a different API URL into the **browser bundle**, build the frontend with a build-arg (matches **`frontend/Dockerfile`**):
+Frontend build-arg (matches **`frontend/Dockerfile`**):
 
 ```bash
 docker build -t YOUR_USER/jetson-ai-dashboard-frontend:1.2.0 \
@@ -179,4 +195,4 @@ docker build -t YOUR_USER/jetson-ai-dashboard-frontend:1.2.0 \
 ## LAN / ports
 
 - Other devices: `http://<host-LAN-IP>:3000` (firewall permitting).
-- **8001** = host → backend container **8000**; **`backend:8000`** = hostname on the Compose network.
+- **8001** = host → backend container **8000**; **`backend:8000`** on the Compose network.

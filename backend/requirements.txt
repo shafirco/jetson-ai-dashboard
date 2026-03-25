@@ -1,3 +1,4 @@
+# Local dev: Ultralytics + PyTorch. The Docker image uses ONNXRuntime only (see Dockerfile).
 fastapi
 uvicorn
 pillow

@@ -1,15 +1,17 @@
 """FastAPI service: YOLOv8n object detection on uploaded frames or base64 JSON."""
 import base64
 import io
+import os
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, Field
-from ultralytics import YOLO
 
-yolo_model: YOLO | None = None
+yolo_model: Any = None
+onnx_runner: Any = None
 
 
 def _pil_from_upload(data: bytes) -> Image.Image:
@@ -24,6 +26,9 @@ def _pil_from_base64(s: str) -> Image.Image:
 
 
 def _run_detection(image: Image.Image) -> list[dict]:
+    if onnx_runner is not None:
+        return onnx_runner.predict_pil(image)
+
     assert yolo_model is not None
     results = yolo_model.predict(image, verbose=False)
     if not results:
@@ -56,8 +61,18 @@ def _run_detection(image: Image.Image) -> list[dict]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global yolo_model
-    yolo_model = YOLO("yolov8n.pt")
+    global yolo_model, onnx_runner
+    onnx_path = os.environ.get("YOLO_ONNX_PATH", "").strip()
+    if onnx_path:
+        from onnx_infer import OnnxYoloRunner
+
+        onnx_runner = OnnxYoloRunner(onnx_path)
+        yolo_model = None
+    else:
+        from ultralytics import YOLO
+
+        yolo_model = YOLO("yolov8n.pt")
+        onnx_runner = None
     yield
 
 
