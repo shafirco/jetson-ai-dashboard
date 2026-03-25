@@ -1,11 +1,68 @@
-"""Mock AI service: accepts a frame upload, returns random detections + bboxes (640x360 space)."""
-from fastapi import FastAPI, File, UploadFile
+"""FastAPI service: YOLOv8n object detection on uploaded frames or base64 JSON."""
+import base64
+import io
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-import random
+from PIL import Image
+from pydantic import BaseModel, Field
+from ultralytics import YOLO
 
-app = FastAPI()
+yolo_model: YOLO | None = None
 
-# Broad CORS — useful if anything calls this API from a browser origin directly (e.g. local dev).
+
+def _pil_from_upload(data: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def _pil_from_base64(s: str) -> Image.Image:
+    if "," in s and s.strip().startswith("data:"):
+        s = s.split(",", 1)[1]
+    raw = base64.b64decode(s, validate=True)
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def _run_detection(image: Image.Image) -> list[dict]:
+    assert yolo_model is not None
+    results = yolo_model.predict(image, verbose=False)
+    if not results:
+        return []
+    r = results[0]
+    names = r.names or {}
+    out: list[dict] = []
+    if r.boxes is None or len(r.boxes) == 0:
+        return out
+    for box in r.boxes:
+        cls_id = int(box.cls.item())
+        conf = float(box.conf.item())
+        label = names.get(cls_id, str(cls_id))
+        xyxy = box.xyxy[0].tolist()
+        x1, y1, x2, y2 = xyxy
+        out.append(
+            {
+                "label": label,
+                "confidence": round(conf, 2),
+                "bbox": {
+                    "x": int(x1),
+                    "y": int(y1),
+                    "width": int(x2 - x1),
+                    "height": int(y2 - y1),
+                },
+            }
+        )
+    return out
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global yolo_model
+    yolo_model = YOLO("yolov8n.pt")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -13,58 +70,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OBJECTS = ["person", "car", "dog", "bicycle", "truck", "cat", "bus"]
+
+class DetectRequest(BaseModel):
+    image: str = Field(..., description="Base64-encoded image (optional data: URL prefix)")
 
 
-def bbox_for_label(label: str) -> dict:
-    """Pixel bbox for 640x360 canvas; presets match frontend drawScene placeholders (walk=0, carX=280)."""
-    # Tiny jitter so responses look less identical between calls.
-    j = lambda: random.randint(-2, 2)
-    if label == "person":
-        b = {"x": 80, "y": 30, "width": 80, "height": 200}
-    elif label in ("dog", "cat"):
-        b = {"x": 95, "y": 125, "width": 52, "height": 68}
-    elif label == "bicycle":
-        b = {"x": 420, "y": 195, "width": 75, "height": 95}
-    elif label in ("car", "truck", "bus"):
-        b = {"x": 280, "y": 168, "width": 180, "height": 112}
-    else:
-        b = {"x": 200, "y": 100, "width": 100, "height": 100}
+@app.post("/detect")
+async def detect_json(body: DetectRequest):
+    try:
+        pil = _pil_from_base64(body.image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid base64 image") from exc
+    dets = _run_detection(pil)
     return {
-        "x": b["x"] + j(),
-        "y": b["y"] + j(),
-        "width": b["width"] + j(),
-        "height": b["height"] + j(),
+        "objects": [
+            {"label": d["label"], "confidence": d["confidence"]} for d in dets
+        ]
     }
 
 
 @app.post("/analyze")
 async def analyze_frame(file: UploadFile = File(...)):
-    # Consume upload body (real pipeline would decode image here).
-    _ = await file.read()
+    raw = await file.read()
+    try:
+        pil = _pil_from_upload(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid image file") from exc
 
-    # Simulate 1–3 detected class names and build per-object scores + boxes.
-    k = random.randint(1, 3)
-    detected = random.sample(OBJECTS, k=k)
-    detections = []
-    for label in detected:
-        conf = round(random.uniform(0.75, 0.99), 2)
-        detections.append(
-            {
-                "label": label,
-                "confidence": conf,
-                "bbox": bbox_for_label(label),
-            }
-        )
-    avg_conf = round(
-        sum(d["confidence"] for d in detections) / len(detections), 2
-    ) if detections else 0.0
-    names = ", ".join(detected)
+    detections = _run_detection(pil)
+    detected = [d["label"] for d in detections]
+    avg_conf = (
+        round(sum(d["confidence"] for d in detections) / len(detections), 2)
+        if detections
+        else 0.0
+    )
+    if detected:
+        names = ", ".join(detected)
+        label = f"Detected: {names} ({avg_conf})"
+    else:
+        label = "No objects detected"
     return {
         "status": "ok",
         "detected": detected,
         "confidence": avg_conf,
-        "label": f"Detected: {names} ({avg_conf})",
+        "label": label,
         "detections": detections,
     }
 
