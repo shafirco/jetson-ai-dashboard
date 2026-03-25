@@ -1,3 +1,5 @@
+name: jetson-ai-dashboard
+
 services:
   backend:
     build: ./backend

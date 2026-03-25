@@ -1,6 +1,11 @@
 "use client";
+/**
+ * Dashboard: live webcam (getUserMedia), detection overlays on a transparent canvas,
+ * hidden snapshot canvas for PNG uploads to /api/analyze, same shell UI as before.
+ */
 import { useCallback, useEffect, useRef, useState } from "react";
 
+// Snapshot + overlay resolution; backend bboxes are defined in this coordinate space.
 const W = 640;
 const H = 360;
 
@@ -21,91 +26,14 @@ type HistoryEntry = {
   detections: Detection[];
 };
 
-function drawScene(ctx: CanvasRenderingContext2D) {
-  const now = performance.now();
-  const t = now * 0.001;
-
-  ctx.fillStyle = "#1a1a2e";
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.strokeStyle = "#ffffff11";
-  for (let i = 0; i < W; i += 40) {
-    ctx.beginPath();
-    ctx.moveTo(i, 0);
-    ctx.lineTo(i, H);
-    ctx.stroke();
-  }
-  for (let i = 0; i < H; i += 40) {
-    ctx.beginPath();
-    ctx.moveTo(0, i);
-    ctx.lineTo(W, i);
-    ctx.stroke();
-  }
-
-  ctx.fillStyle = "#00ff88";
-  ctx.font = "bold 18px monospace";
-  ctx.fillText("● JETSON LIVE FEED", 20, 36);
-
-  if (Math.floor(now / 500) % 2 === 0) {
-    ctx.fillStyle = "#ff4444";
-    ctx.font = "bold 14px monospace";
-    ctx.fillText("● REC", 220, 36);
-  }
-
-  ctx.fillStyle = "#88ffcc";
-  ctx.font = "14px monospace";
-  const wall = Date.now();
-  const ms = String(Math.floor((wall % 1000) / 10)).padStart(2, "0");
-  const clock = new Date(wall).toLocaleTimeString("en-GB", {
-    hour12: false,
-  });
-  ctx.fillText(`${clock}.${ms}`, W - 210, 36);
-
-  const walk = Math.sin(t * 1.4) * 45;
-  ctx.fillStyle = "#ffffff33";
-  ctx.fillRect(80 + walk, 80, 80, 150);
-  ctx.fillStyle = "#ffffff44";
-  ctx.beginPath();
-  ctx.arc(120 + walk, 60, 30, 0, Math.PI * 2);
-  ctx.fill();
-
-  const carX = 280 + Math.sin(t * 0.9) * 100;
-  ctx.fillStyle = "#4444ff55";
-  ctx.fillRect(carX, 200, 180, 80);
-  ctx.fillRect(carX + 40, 170, 100, 40);
-
-  const scanY = ((now / 12) % (H - 40)) + 20;
-  ctx.strokeStyle = "#00ff8833";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(0, scanY);
-  ctx.lineTo(W, scanY);
-  ctx.stroke();
-  ctx.lineWidth = 1;
-}
-
-function adjustBboxForMotion(d: Detection, now: number): Bbox {
-  const t = now * 0.001;
-  const walk = Math.sin(t * 1.4) * 45;
-  const carShift = Math.sin(t * 0.9) * 100;
-  const { bbox, label } = d;
-  if (label === "person") {
-    return { ...bbox, x: bbox.x + walk };
-  }
-  if (label === "car" || label === "truck" || label === "bus") {
-    return { ...bbox, x: bbox.x + carShift };
-  }
-  return { ...bbox };
-}
-
+/** Draw label chip + rectangle for each detection (coordinates match 640×360 mock layout). */
 function drawDetectionOverlays(
   ctx: CanvasRenderingContext2D,
   detections: Detection[],
-  now: number,
 ) {
+  ctx.clearRect(0, 0, W, H);
   for (const d of detections) {
-    const box = adjustBboxForMotion(d, now);
-    const { x, y, width, height } = box;
+    const { x, y, width, height } = d.bbox;
     const color = GREEN_LABELS.has(d.label) ? "#22c55e" : "#3b82f6";
     const labelText = `${d.label} ${(d.confidence * 100).toFixed(0)}%`;
 
@@ -132,7 +60,11 @@ function drawDetectionOverlays(
 }
 
 export default function Dashboard() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+
   const detectionsRef = useRef<Detection[]>([]);
   const frameCountRef = useRef(0);
   const lastFpsSampleRef = useRef(performance.now());
@@ -142,6 +74,8 @@ export default function Dashboard() {
   const [footerTime, setFooterTime] = useState(() => Date.now());
   const [fps, setFps] = useState(0);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraReady, setCameraReady] = useState(false);
 
   const pushHistory = useCallback((summary: string, detections: Detection[]) => {
     const entry: HistoryEntry = {
@@ -153,17 +87,72 @@ export default function Dashboard() {
     setHistory((prev) => [entry, ...prev].slice(0, 5));
   }, []);
 
+  // Open default webcam; user must grant permission (HTTPS or localhost).
   useEffect(() => {
-    const canvas = canvasRef.current;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+          audio: false,
+        });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        streamRef.current = stream;
+        const video = videoRef.current;
+        if (!video) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        video.srcObject = stream;
+        await video.play();
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        setCameraError(null);
+        setCameraReady(true);
+        setStatus("loading");
+      } catch {
+        if (!cancelled) {
+          setCameraError(
+            "Camera permission denied or no camera found. Allow access in the browser bar and reload.",
+          );
+          setStatus("error");
+          setResult("Camera unavailable");
+          setCameraReady(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      const v = videoRef.current;
+      if (v) v.srcObject = null;
+      setCameraReady(false);
+    };
+  }, []);
+
+  // Redraw detection boxes on top of the video (~30 FPS).
+  useEffect(() => {
+    if (!cameraReady) return;
+
+    const canvas = overlayCanvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext("2d", {
-      alpha: false,
-      willReadFrequently: true,
-    });
+    const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) return;
 
-    const fps = 30;
+    const targetFps = 30;
     const drawId = window.setInterval(() => {
       const now = performance.now();
       frameCountRef.current += 1;
@@ -175,24 +164,35 @@ export default function Dashboard() {
         lastFpsSampleRef.current = now;
       }
 
-      drawScene(ctx);
-      drawDetectionOverlays(ctx, detectionsRef.current, now);
-    }, 1000 / fps);
+      const video = videoRef.current;
+      if (video && video.readyState >= 2) {
+        drawDetectionOverlays(ctx, detectionsRef.current);
+      }
+    }, 1000 / targetFps);
 
     return () => clearInterval(drawId);
-  }, []);
+  }, [cameraReady]);
 
   useEffect(() => {
     const t = window.setInterval(() => setFooterTime(Date.now()), 1000);
     return () => clearInterval(t);
   }, []);
 
+  // Copy current video frame to off-screen canvas and POST as PNG (mock AI unchanged).
   useEffect(() => {
-    const runAnalyze = () => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
+    if (!cameraReady) return;
 
-      canvas.toBlob(async (blob) => {
+    const runAnalyze = () => {
+      const video = videoRef.current;
+      const cap = captureCanvasRef.current;
+      if (!video || !cap || video.readyState < 2) return;
+
+      const cctx = cap.getContext("2d");
+      if (!cctx) return;
+
+      cctx.drawImage(video, 0, 0, W, H);
+
+      cap.toBlob(async (blob) => {
         if (!blob) return;
         const form = new FormData();
         form.append("file", blob, "frame.png");
@@ -225,7 +225,7 @@ export default function Dashboard() {
     const interval = setInterval(runAnalyze, 2000);
     runAnalyze();
     return () => clearInterval(interval);
-  }, [pushHistory]);
+  }, [cameraReady, pushHistory]);
 
   const timeStr = new Date(footerTime).toLocaleTimeString("en-GB", {
     hour12: false,
@@ -239,13 +239,36 @@ export default function Dashboard() {
 
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 lg:flex-row lg:items-start lg:justify-center">
         <div className="mx-auto flex w-full min-w-0 max-w-[640px] flex-1 flex-col">
-          <div className="relative aspect-video w-full overflow-hidden rounded-lg border-2 border-green-500 shadow-lg shadow-green-900">
+          <div className="relative aspect-video w-full overflow-hidden rounded-lg border-2 border-green-500 bg-black shadow-lg shadow-green-900">
+            <video
+              ref={videoRef}
+              className="absolute inset-0 block h-full w-full object-cover"
+              playsInline
+              muted
+              autoPlay
+            />
             <canvas
-              ref={canvasRef}
+              ref={overlayCanvasRef}
               width={W}
               height={H}
-              className="absolute inset-0 block h-full w-full"
+              className="pointer-events-none absolute inset-0 block h-full w-full"
             />
+            {/* Off-DOM-sized canvas for snapshots only (no overlays in the upload). */}
+            <canvas
+              ref={captureCanvasRef}
+              width={W}
+              height={H}
+              className="pointer-events-none fixed top-0 left-[-10000px] opacity-0"
+              aria-hidden
+            />
+
+            {cameraError && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/85 p-4 text-center">
+                <p className="max-w-sm font-mono text-sm text-red-300">
+                  {cameraError}
+                </p>
+              </div>
+            )}
 
             <div
               className={`absolute top-3 right-3 rounded px-2 py-1 font-mono text-xs font-bold ${

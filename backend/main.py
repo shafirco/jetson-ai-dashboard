@@ -1,9 +1,11 @@
+"""Mock AI service: accepts a frame upload, returns random detections + bboxes (640x360 space)."""
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import random
 
 app = FastAPI()
 
+# Broad CORS — useful if anything calls this API from a browser origin directly (e.g. local dev).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,7 +17,8 @@ OBJECTS = ["person", "car", "dog", "bicycle", "truck", "cat", "bus"]
 
 
 def bbox_for_label(label: str) -> dict:
-    """Pixel bbox for 640x360 canvas; person/car aligned to placeholder bases (walk=0, carX=280)."""
+    """Pixel bbox for 640x360 canvas; presets match frontend drawScene placeholders (walk=0, carX=280)."""
+    # Tiny jitter so responses look less identical between calls.
     j = lambda: random.randint(-2, 2)
     if label == "person":
         b = {"x": 80, "y": 30, "width": 80, "height": 200}
@@ -37,8 +40,10 @@ def bbox_for_label(label: str) -> dict:
 
 @app.post("/analyze")
 async def analyze_frame(file: UploadFile = File(...)):
+    # Consume upload body (real pipeline would decode image here).
     _ = await file.read()
 
+    # Simulate 1–3 detected class names and build per-object scores + boxes.
     k = random.randint(1, 3)
     detected = random.sample(OBJECTS, k=k)
     detections = []
