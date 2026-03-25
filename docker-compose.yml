@@ -8,7 +8,8 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 700M
+          cpus: '4'
 
   frontend:
     build:
@@ -24,4 +25,4 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 300M
